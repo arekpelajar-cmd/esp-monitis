@@ -5,6 +5,7 @@
 [![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS%20Dual--Core-orange.svg)](https://www.freertos.org/)
 [![Protocol](https://img.shields.io/badge/Protocol-MQTT%20%2F%20WiFi-informational.svg)](https://mqtt.org/)
 [![Display](https://img.shields.io/badge/Display-SH1106%20%2F%20SSD1306%20OLED-purple.svg)](https://github.com/adafruit/Adafruit-GFX-Library)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Smart IV Drip Monitor (Monitis)** adalah sistem pemantauan dan kontrol laju tetesan infus medis cerdas berbasis mikrokontroler **ESP32 Dual-Core**. Sistem ini dirancang untuk memantau dan mengendalikan **dua ranjang pasien (Dual-Channel)** sekaligus secara independen dalam satu perangkat, menghadirkan integrasi kendali PID aktuator klem servo, antarmuka layar OLED lokal dengan kendali Rotary Encoder, serta pemantauan jarak jauh berbasis MQTT.
 
@@ -262,4 +263,5 @@ pio run -t monitor
 ---
 
 ## 📄 Lisensi
-Hak Cipta © 2026 Tim Pengembang **Monitis**. Didistribusikan untuk keperluan riset medis, kompetisi inovasi teknologi kesehatan, dan pengembangan sumber terbuka (*Open Source*).
+Proyek ini dilisensikan di bawah [MIT License](LICENSE) - Hak Cipta © 2026 Tim Pengembang **Monitis** (`arekpelajar-cmd`).  
+Bebas digunakan, dimodifikasi, dan didistribusikan untuk keperluan riset medis, kompetisi inovasi teknologi kesehatan, maupun pengembangan sumber terbuka (*Open Source*).
