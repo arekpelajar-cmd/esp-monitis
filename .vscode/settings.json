@@ -1,0 +1,7 @@
+{
+    "clangd.path": "C:\\Users\\MyBook Hype AMD\\.platformio\\packages\\tool-clangd-esp\\bin\\clangd.exe",
+    "clangd.arguments": [
+        "--compile-commands-dir=d:/koding/lomba/monitis/.cache/clangd",
+        "--query-driver=C:/Users/MyBook Hype AMD/.platformio/packages/toolchain-*/bin/*,C:/Users/MyBook Hype AMD/.platformio/packages/tool-*/bin/*"
+    ]
+}
