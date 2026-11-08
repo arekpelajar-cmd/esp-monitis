@@ -2,12 +2,42 @@
 #include "Config.h"
 #include "Sensor.h"
 
+// === Helper: Hitung field telemetri medis per channel ===
+// Dipanggil setiap kali DPM atau sisaVolume berubah
+static void updateMedicalFields(int i, unsigned long now) {
+  // 1. Flow Rate (ml/jam) = actualDPM / dropFactor * 60
+  if (infus[i].actualDPM > 0 && infus[i].dropFactor > 0) {
+    infus[i].flowRateMlHr = ((float)infus[i].actualDPM / (float)infus[i].dropFactor) * 60.0f;
+  } else {
+    infus[i].flowRateMlHr = 0.0f;
+  }
+
+  // 2. ETA (menit sisa) = (sisaVolume * dropFactor) / actualDPM
+  if (infus[i].actualDPM > 0 && infus[i].dropFactor > 0 && infus[i].sisaVolume > 0.0f) {
+    infus[i].etaMinutes = (long)((infus[i].sisaVolume * (float)infus[i].dropFactor) / (float)infus[i].actualDPM);
+  } else {
+    infus[i].etaMinutes = 0L;
+  }
+
+  // 3. AlarmCode: Klasifikasi jenis anomali
+  if (!infus[i].isAnomaly) {
+    infus[i].alarmCode = ALARM_NONE;
+  } else if (infus[i].sisaVolume <= 10.0f) {
+    infus[i].alarmCode = ALARM_EMPTY;      // Cairan hampir/sudah habis
+  } else {
+    infus[i].alarmCode = ALARM_OCCLUSION;  // Mampet / selang tertekuk
+  }
+}
+
 void initControl() {
   for (int i = 0; i < 2; i++) {
     infus[i].servo.attach(infus[i].pinServo, 500, 2400);
     infus[i].servoAngle = infus[i].isPaused ? 0 : 90;
     infus[i].servo.write(infus[i].servoAngle);
     infus[i].lastDropTime = millis();
+    infus[i].flowRateMlHr = 0.0f;
+    infus[i].etaMinutes   = 0L;
+    infus[i].alarmCode    = ALARM_NONE;
   }
 }
 
@@ -31,9 +61,9 @@ void taskControlCode(void *pvParameters) {
           if (infus[i].actualDPM < 0)
             infus[i].actualDPM = 0;
 
-          // Pengurangan sisa volume berdasarkan actual DPM (20 tetes/ml)
+          // Pengurangan sisa volume berdasarkan actual DPM
           float dropsPerSec = (float)infus[i].actualDPM / 60.0f;
-          infus[i].sisaVolume -= (dropsPerSec / 20.0f);
+          infus[i].sisaVolume -= (dropsPerSec / (float)infus[i].dropFactor);
           if (infus[i].sisaVolume < 0)
             infus[i].sisaVolume = 0;
 
@@ -47,6 +77,7 @@ void taskControlCode(void *pvParameters) {
         } else {
           infus[i].actualDPM = 0;
         }
+        updateMedicalFields(i, now);
       }
       lastDpmCalcTime = now;
     }
@@ -58,8 +89,7 @@ void taskControlCode(void *pvParameters) {
         infus[i].actualDPM = drops * 60;
 
         if (!infus[i].isPaused && drops > 0) {
-          // Drop factor standar 20 tetes/ml
-          infus[i].sisaVolume -= ((float)drops / 20.0f);
+          infus[i].sisaVolume -= ((float)drops / (float)infus[i].dropFactor);
           if (infus[i].sisaVolume < 0)
             infus[i].sisaVolume = 0;
         }
@@ -73,6 +103,7 @@ void taskControlCode(void *pvParameters) {
             currentScreen = SCREEN_ALARM_WARNING;
           }
         }
+        updateMedicalFields(i, now);
       }
       lastDpmCalcTime = now;
     }

@@ -43,6 +43,10 @@
 #define TOPIC_CONTROL_BED1   "monitis/bed1/control"
 #define TOPIC_CONTROL_BED2   "monitis/bed2/control"
 
+// Kode Alarm (digunakan di JSON MQTT)
+// 0 = NONE, 1 = OCCLUSION (mampet), 2 = EMPTY (habis)
+enum AlarmCode { ALARM_NONE = 0, ALARM_OCCLUSION = 1, ALARM_EMPTY = 2 };
+
 // --- STRUKTUR DATA CHANNEL INFUS ---
 struct DripChannel {
   int id;
@@ -52,12 +56,18 @@ struct DripChannel {
   // Status Infus
   volatile int targetDPM;
   volatile int actualDPM;
-  volatile float sisaVolume; // ml
-  volatile float volumeAwal; // ml
+  volatile float sisaVolume;    // ml
+  volatile float volumeAwal;    // ml
   volatile bool isPaused;
   volatile bool isAnomaly;
-  volatile bool isSensorActive; // true = sensor aktif, false = sensor dinonaktifkan (abaikan alarm)
+  volatile bool isSensorActive; // true = sensor aktif, false = dinonaktifkan (abaikan alarm)
   volatile unsigned long lastDropTime;
+
+  // Field Kalkulasi Medis Tambahan
+  volatile float flowRateMlHr;  // Laju aliran dalam ml/jam
+  volatile long etaMinutes;     // Estimasi menit sisa cairan
+  volatile int dropFactor;      // 20 tetes/ml (dewasa) atau 60 tetes/ml (anak-anak)
+  volatile AlarmCode alarmCode; // Kode spesifik jenis alarm
 
   // PID & Kontrol Servo
   float kp;

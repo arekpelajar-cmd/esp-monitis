@@ -9,6 +9,58 @@ static PubSubClient mqtt(espClient);
 static unsigned long lastMqttRetry = 0;
 static unsigned long lastTelemetryTime = 0;
 
+// Helper: Konversi AlarmCode enum ke string untuk JSON
+static const char* alarmCodeStr(AlarmCode code) {
+    switch (code) {
+        case ALARM_OCCLUSION: return "OCCLUSION";
+        case ALARM_EMPTY:     return "EMPTY";
+        default:              return "NONE";
+    }
+}
+
+// Helper: Format menit sisa menjadi "HH:MM" atau "STOPPED"
+static String etaFormatted(long etaMin, bool isAnomaly, bool isPaused) {
+    if (isAnomaly || isPaused) return "STOPPED";
+    if (etaMin <= 0) return "00:00";
+    long h = etaMin / 60;
+    long m = etaMin % 60;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02ld:%02ld", h, m);
+    return String(buf);
+}
+
+// Helper: Bangun JSON lengkap satu bed ke dalam JsonObject
+static void buildBedJson(JsonObject& b, int i, unsigned long now) {
+    long lastDropSecAgo = (long)((now - infus[i].lastDropTime) / 1000UL);
+
+    b["bed"]             = i + 1;
+    b["sensor_active"]   = (bool)infus[i].isSensorActive;
+    b["paused"]          = (bool)infus[i].isPaused;
+    b["anomaly"]         = (bool)infus[i].isAnomaly;
+    b["alarm_code"]      = alarmCodeStr(infus[i].alarmCode);
+
+    b["target_dpm"]      = infus[i].targetDPM;
+    b["actual_dpm"]      = infus[i].actualDPM;
+    b["flow_rate_ml_hr"] = serialized(String(infus[i].flowRateMlHr, 1));
+
+    float sisaMl = (float)((int)(infus[i].sisaVolume * 10.0f)) / 10.0f;
+    float volAwal = infus[i].volumeAwal;
+    float pct = (volAwal > 0.0f) ? (sisaMl / volAwal * 100.0f) : 0.0f;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+
+    b["sisa_ml"]         = serialized(String(sisaMl, 1));
+    b["volume_awal_ml"]  = serialized(String(volAwal, 1));
+    b["persen_sisa"]     = serialized(String(pct, 1));
+    b["eta_minutes"]     = infus[i].etaMinutes;
+    b["eta_formatted"]   = etaFormatted(infus[i].etaMinutes, infus[i].isAnomaly, infus[i].isPaused);
+
+    b["drop_factor"]     = infus[i].dropFactor;
+    b["last_drop_sec_ago"] = lastDropSecAgo;
+    b["servo_angle"]     = infus[i].servoAngle;
+    b["pulse_count"]     = (i == 0) ? pulseCountA : pulseCountB;
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String msg;
     for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
@@ -86,60 +138,51 @@ void taskCommsCode(void *pvParameters) {
                 if (now - lastTelemetryTime >= 3000) {
                     lastTelemetryTime = now;
 
-                    // 1. Publish Bed 1
-                    DynamicJsonDocument doc1(256);
-                    doc1["bed"] = 1;
-                    doc1["target_dpm"] = infus[0].targetDPM;
-                    doc1["actual_dpm"] = infus[0].actualDPM;
-                    doc1["sisa_ml"] = infus[0].sisaVolume;
-                    doc1["paused"] = infus[0].isPaused;
-                    doc1["anomaly"] = infus[0].isAnomaly;
-                    doc1["sensor_active"] = (bool)infus[0].isSensorActive;
-                    String jsonStr1;
-                    serializeJson(doc1, jsonStr1);
-                    mqtt.publish(TOPIC_BED1_TELEMETRY, jsonStr1.c_str());
+                    // Hitung status sistem global
+                    bool anyAnomaly = infus[0].isAnomaly || infus[1].isAnomaly;
+                    const char* sysStatus = anyAnomaly ? "ALARM" : "NORMAL";
 
-                    // 2. Publish Bed 2
-                    DynamicJsonDocument doc2(256);
-                    doc2["bed"] = 2;
-                    doc2["target_dpm"] = infus[1].targetDPM;
-                    doc2["actual_dpm"] = infus[1].actualDPM;
-                    doc2["sisa_ml"] = infus[1].sisaVolume;
-                    doc2["paused"] = infus[1].isPaused;
-                    doc2["anomaly"] = infus[1].isAnomaly;
-                    doc2["sensor_active"] = (bool)infus[1].isSensorActive;
-                    String jsonStr2;
-                    serializeJson(doc2, jsonStr2);
-                    mqtt.publish(TOPIC_BED2_TELEMETRY, jsonStr2.c_str());
-
-                    // 3. Publish Global Summary Lengkap (Semua Data Sistem & Kedua Bed Terpadu)
-                    DynamicJsonDocument docAll(768);
-                    docAll["device_id"] = "MONITIS-ESP32";
-                    docAll["uptime_sec"] = millis() / 1000;
-                    docAll["ip"] = WiFi.localIP().toString();
-                    docAll["rssi"] = WiFi.RSSI();
-
-                    JsonArray beds = docAll.createNestedArray("beds");
-                    for (int i = 0; i < 2; i++) {
-                        JsonObject b = beds.createNestedObject();
-                        b["bed"] = i + 1;
-                        b["target_dpm"] = infus[i].targetDPM;
-                        b["actual_dpm"] = infus[i].actualDPM;
-                        b["sisa_ml"] = (int)(infus[i].sisaVolume * 10.0f) / 10.0f;
-                        b["volume_awal_ml"] = infus[i].volumeAwal;
-                        float pct = (infus[i].sisaVolume / infus[i].volumeAwal) * 100.0f;
-                        if (pct < 0) pct = 0;
-                        if (pct > 100) pct = 100;
-                        b["persen_sisa"] = (int)(pct * 10.0f) / 10.0f;
-                        b["paused"] = infus[i].isPaused;
-                        b["anomaly"] = infus[i].isAnomaly;
-                        b["sensor_active"] = (bool)infus[i].isSensorActive;
-                        b["servo_angle"] = infus[i].servoAngle;
-                        b["pulse_count"] = (i == 0) ? pulseCountA : pulseCountB;
+                    // === 1. Publish Bed 1 (topik khusus) ===
+                    {
+                        DynamicJsonDocument doc1(512);
+                        doc1["device_id"]     = "MONITIS-ESP32";
+                        doc1["uptime_sec"]    = now / 1000;
+                        doc1["system_status"] = sysStatus;
+                        JsonObject b1 = doc1.createNestedObject("bed_data");
+                        buildBedJson(b1, 0, now);
+                        String s1; serializeJson(doc1, s1);
+                        mqtt.publish(TOPIC_BED1_TELEMETRY, s1.c_str());
                     }
-                    String jsonStrAll;
-                    serializeJson(docAll, jsonStrAll);
-                    mqtt.publish(TOPIC_ALL_TELEMETRY, jsonStrAll.c_str());
+
+                    // === 2. Publish Bed 2 (topik khusus) ===
+                    {
+                        DynamicJsonDocument doc2(512);
+                        doc2["device_id"]     = "MONITIS-ESP32";
+                        doc2["uptime_sec"]    = now / 1000;
+                        doc2["system_status"] = sysStatus;
+                        JsonObject b2 = doc2.createNestedObject("bed_data");
+                        buildBedJson(b2, 1, now);
+                        String s2; serializeJson(doc2, s2);
+                        mqtt.publish(TOPIC_BED2_TELEMETRY, s2.c_str());
+                    }
+
+                    // === 3. Publish Global Summary Lengkap Medical-Grade ===
+                    {
+                        DynamicJsonDocument docAll(1024);
+                        docAll["device_id"]     = "MONITIS-ESP32";
+                        docAll["uptime_sec"]    = now / 1000;
+                        docAll["wifi_rssi"]     = WiFi.RSSI();
+                        docAll["ip_address"]    = WiFi.localIP().toString();
+                        docAll["system_status"] = sysStatus;
+
+                        JsonArray beds = docAll.createNestedArray("beds");
+                        for (int i = 0; i < 2; i++) {
+                            JsonObject b = beds.createNestedObject();
+                            buildBedJson(b, i, now);
+                        }
+                        String sAll; serializeJson(docAll, sAll);
+                        mqtt.publish(TOPIC_ALL_TELEMETRY, sAll.c_str());
+                    }
                 }
             }
         }
