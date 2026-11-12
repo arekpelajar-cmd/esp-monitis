@@ -11,10 +11,10 @@
 //                nominal flow conversions, drop factor/alarm, controller state.
 DripChannel infus[2] = {
     {0, PIN_IR_A, 20, 0, 450.0f, 500.0f,
-     BED_STANDBY, true, false, false, false, false, false, 0,
+     BED_PAUSED, true, false, false, false, false, false, 0,
      0.0f, 0.0f, 0L, 20, ALARM_NONE, 0.0f, 0.0f, 0.0f, false, false},
     {1, PIN_IR_B, 15, 0, 120.0f, 500.0f,
-     BED_STANDBY, true, false, false, false, false, false, 0,
+     BED_PAUSED, true, false, false, false, false, false, 0,
      0.0f, 0.0f, 0L, 20, ALARM_NONE, 0.0f, 0.0f, 0.0f, false, false}
 };
 
