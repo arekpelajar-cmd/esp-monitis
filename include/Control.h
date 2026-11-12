@@ -5,5 +5,6 @@
 
 void initControl();
 void taskControlCode(void *pvParameters);
+bool preparePumpOutputForInactiveState(int channel);
 
 #endif

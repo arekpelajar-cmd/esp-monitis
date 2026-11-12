@@ -1,6 +1,9 @@
 #include "Display.h"
 #include "Comms.h"
 #include "Config.h"
+#include "FlowConversion.h"
+#include "PumpOutput.h"
+#include "Sensor.h"
 #include <Adafruit_GFX.h>
 #include "SH1106Display.h"
 #include <WiFi.h>
@@ -20,6 +23,29 @@
 static Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 static unsigned long startupBeginTime = 0;
 static unsigned long confirmScreenTime = 0;
+
+static const char *bedStateText(BedState state) {
+  return bedStateName(state);
+}
+
+static const char *dpmStatusText(int ch) {
+  if (!infus[ch].isSensorActive)
+    return "Sensor OFF";
+  if (infus[ch].dpmValid)
+    return "Valid";
+  if (infus[ch].dpmStale)
+    return "Data stale";
+  if (infus[ch].state == BED_ALARM) {
+    return infus[ch].alarmCode == ALARM_PUMP_OUTPUT_FAILURE
+               ? "Gangguan pompa"
+               : "Aliran tidak terdeteksi";
+  }
+  if (infus[ch].state == BED_STANDBY)
+    return "STANDBY";
+  if (infus[ch].state == BED_PAUSED)
+    return "PAUSED";
+  return infus[ch].state == BED_RUNNING ? "Mengukur" : "Tidak valid";
+}
 
 // ==========================================
 // KUMPULAN IKON & SIMBOL GRAFIS (PIXEL PERFECT)
@@ -252,27 +278,35 @@ void renderSummary() {
     display.setCursor(x + 4, 4);
     display.print((i == 0) ? "BED 1" : "BED 2");
 
-    // Status Ikon (Play / Pause)
-    if (infus[i].isPaused) {
-      drawPauseIcon(x + 46, 4, fgColor);
-    } else {
-      drawPlayIcon(x + 46, 4, fgColor);
+    // Alarm marker remains visible on the affected bed.
+    if (infus[i].state == BED_ALARM) {
+      if (infus[i].alarmAcknowledged || ((millis() / 350) % 2 == 0))
+        display.fillTriangle(x + 49, 3, x + 44, 11, x + 54, 11, fgColor);
     }
 
-    // Nilai DPM Aktual (Ukuran Besar)
-    display.setTextSize(3);
-    int dpm = infus[i].actualDPM;
-    int dpmX = x + 14;
-    if (dpm < 10)
-      dpmX = x + 24;
-    else if (dpm >= 100)
-      dpmX = x + 5;
-    display.setCursor(dpmX, 18);
-    display.print(dpm);
-
-    // Baris Sisa Volume di Bawah
     display.setTextSize(1);
-    display.setCursor(x + 4, 51);
+    display.setCursor(x + 4, 15);
+    display.print(infus[i].state == BED_ALARM &&
+                          infus[i].alarmAcknowledged
+                      ? "ALARM ACK"
+                      : bedStateText(infus[i].state));
+
+    display.setTextSize(1);
+    display.setCursor(x + 4, 25);
+    display.printf("T:%d DPM", infus[i].targetDPM);
+    display.setCursor(x + 4, 35);
+    if (infus[i].dpmValid)
+      display.printf("A:%d DPM", infus[i].actualDPM);
+    else if (infus[i].state == BED_ALARM)
+      display.print(infus[i].dpmStale ? "Data stale" : "No drop");
+    else if (infus[i].dpmStale)
+      display.print("Stale");
+    else
+      display.print(dpmStatusText(i));
+
+    display.setCursor(x + 4, 49);
+    display.print(infus[i].pumpCommandActive ? "Cmd: AKTIF" : "Cmd: OFF");
+    display.setCursor(x + 4, 57);
     display.printf("Sisa:%dml", (int)infus[i].sisaVolume);
   }
 }
@@ -286,44 +320,149 @@ void renderDetail(int ch) {
   display.setCursor(4, 2);
   display.printf("[ BED %d ]", ch + 1);
 
-  // Status Play / Pause di pojok kanan atas
-  if (infus[ch].isPaused) {
-    drawPauseIcon(116, 2, SSD1306_WHITE);
-  } else {
-    drawPlayIcon(116, 2, SSD1306_WHITE);
-  }
-
   // Garis pemisah header
   display.drawLine(0, 13, 128, 13, SSD1306_WHITE);
+  display.setCursor(78, 2);
+  display.print(bedStateText(infus[ch].state));
 
-  // Baris 1: Target DPM dengan Ikon Crosshair
-  drawCrosshairIcon(14, 23, SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(28, 16);
-  display.printf(":[%2d]", infus[ch].targetDPM);
+  display.setTextSize(1);
+  display.setCursor(4, 15);
+  display.printf("Target: %d DPM", infus[ch].targetDPM);
+  display.setCursor(4, 25);
+  if (infus[ch].dropFactor > 0)
+    display.printf("Nominal: %.1f ml/j", infus[ch].targetFlowRateMlHr);
+  else
+    display.print("Nominal: tidak tersedia");
+  display.setCursor(4, 35);
+  if (infus[ch].dpmValid)
+    display.printf("Aktual: %d DPM", infus[ch].actualDPM);
+  else if (infus[ch].state == BED_ALARM &&
+           infus[ch].alarmCode == ALARM_FLOW_NOT_DETECTED)
+    display.print(infus[ch].dpmStale ? "Data stale"
+                                     : "Pulsa: tidak ada");
+  else
+    display.printf("Ukur: %s", dpmStatusText(ch));
+  display.setCursor(4, 45);
+  if (infus[ch].state == BED_ALARM)
+    display.print(infus[ch].alarmAcknowledged ? "Alarm: diakui" : "Alarm: aktif");
+  else if (infus[ch].dpmValid)
+    display.printf("Estimasi: %.1f ml/j", infus[ch].measuredFlowRateMlHr);
+  else
+    display.print("Estimasi: belum valid");
+  display.setCursor(4, 55);
+  if (infus[ch].alarmCode == ALARM_PUMP_OUTPUT_FAILURE)
+    display.print("Pompa: perintah gagal");
+  else
+    display.print(infus[ch].pumpCommandActive ? "Perintah pompa: AKTIF"
+                                               : "Perintah pompa: OFF");
+  display.setCursor(4, 62);
+  display.print("Klik: aksi bed");
+}
 
-  // Baris 2: Aktual DPM dengan Ikon Tetesan Air
-  drawDropIcon(14, 34, SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(28, 33);
-  display.printf(": %d", infus[ch].actualDPM);
-
-  // Baris 3: Progress Sisa Volume (%) & Progress Bar
-  int pct = (int)((infus[ch].sisaVolume / infus[ch].volumeAwal) * 100.0f);
-  if (pct < 0)
-    pct = 0;
-  if (pct > 100)
-    pct = 100;
-
-  display.drawRoundRect(4, 52, 82, 8, 2, SSD1306_WHITE);
-  int fillW = (pct * 78) / 100;
-  if (fillW > 0) {
-    display.fillRoundRect(6, 54, fillW, 4, 1, SSD1306_WHITE);
+static void renderBedActions() {
+  int ch = selectedChannel;
+  const char *actions[3];
+  int count = 3;
+  if (infus[ch].state == BED_STANDBY) {
+    actions[0] = "MULAI bed ini";
+    actions[1] = "Kembali";
+    count = 2;
+  } else if (infus[ch].state == BED_RUNNING) {
+    actions[0] = "PAUSE";
+    actions[1] = "STOP ke STANDBY";
+    actions[2] = "Kembali";
+  } else if (infus[ch].state == BED_PAUSED) {
+    actions[0] = "MULAI LAGI";
+    actions[1] = "STOP ke STANDBY";
+    actions[2] = "Kembali";
+  } else {
+    actions[0] = infus[ch].alarmAcknowledged ? "Alarm diakui" : "Akui alarm";
+    actions[1] = infus[ch].alarmAcknowledged
+                     ? (infus[ch].alarmRecoveryReady ? "Reset ke STANDBY"
+                                                     : "Tunggu 5 tetes valid")
+                     : "Akui dahulu";
+    actions[2] = "Kembali";
   }
 
   display.setTextSize(1);
-  display.setCursor(92, 52);
-  display.printf("%3d%%", pct);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 3);
+  display.printf("BED %d - %s", ch + 1, bedStateText(infus[ch].state));
+  display.drawLine(0, 13, 128, 13, SSD1306_WHITE);
+  for (int i = 0; i < count; i++) {
+    int y = 19 + i * 13;
+    if (i == bedActionIndex) {
+      display.fillRoundRect(2, y - 1, 122, 11, 2, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(6, y + 1);
+    display.print(actions[i]);
+  }
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 57);
+  display.print("Putar pilih, klik OK");
+}
+
+static void renderStartConfirmation() {
+  int ch = selectedChannel;
+  PumpControlProfile profile;
+  const bool pumpReady = isPumpOutputReady(ch, &profile);
+  const bool baseChecksPass = infus[ch].isSensorActive &&
+                    infus[ch].targetDPM >= 5 && infus[ch].targetDPM <= 150 &&
+                    infus[ch].dropFactor > 0 && infus[ch].volumeAwal > 0.0f;
+  float nominalTarget = 0.0f;
+  dpmToNominalFlowMlHr(infus[ch].targetDPM, infus[ch].dropFactor,
+                       &nominalTarget);
+  const bool rateInRange =
+      pumpReady && nominalTarget >= profile.minFlowMlHr &&
+      nominalTarget <= profile.maxFlowMlHr;
+  const bool checksPass = baseChecksPass && rateInRange;
+  const char *checkStatus =
+      !infus[ch].isSensorActive
+          ? "Sensor nonaktif"
+          : infus[ch].targetDPM < 5 || infus[ch].targetDPM > 150 ||
+                    infus[ch].dropFactor <= 0 || infus[ch].volumeAwal <= 0.0f
+                ? "Periksa konfigurasi"
+                : !pumpReady ? "Driver belum siap"
+                             : !rateInRange ? "Target di luar kal."
+                                            : "Driver/kalibrasi siap";
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 2);
+  display.printf("KONFIRMASI MULAI BED %d", ch + 1);
+  display.drawLine(0, 12, 128, 12, SSD1306_WHITE);
+  display.setCursor(4, 16);
+  display.printf("Target: %d DPM", infus[ch].targetDPM);
+  display.setCursor(4, 27);
+  display.printf("Nominal: %.1f ml/j", nominalTarget);
+  display.setCursor(4, 38);
+  display.printf("F:%d V:%d Sensor:%s", infus[ch].dropFactor,
+                 (int)infus[ch].volumeAwal,
+                 infus[ch].isSensorActive ? "ON" : "OFF");
+  display.setCursor(0, 47);
+  display.print(checkStatus);
+  display.setCursor(0, 56);
+  display.print(checksPass ? "Klik OK: MULAI" : "Output pompa terkunci");
+}
+
+static void renderAlarmResetConfirmation() {
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 5);
+  display.printf("RESET ALARM BED %d?", selectedChannel + 1);
+  display.drawLine(0, 16, 128, 16, SSD1306_WHITE);
+  display.setCursor(0, 23);
+  display.print(infus[selectedChannel].alarmRecoveryReady
+                    ? "5 tetes valid: cukup"
+                    : "5 tetes valid: kurang");
+  display.setCursor(0, 35);
+  display.print("Inspeksi sebelum reset.");
+  display.setCursor(0, 47);
+  display.print("Reset bukan tes aliran.");
+  display.setCursor(4, 59);
+  display.print("Klik: reset alarm");
 }
 
 // 5. Main Settings (Menu Utama)
@@ -395,10 +534,11 @@ void renderTargetConfig() {
   // Footer Navigasi
   display.setTextSize(1);
   display.setCursor(6, 54);
-  display.print("OK:Simpan");
-  drawReturnIcon(74, 55, SSD1306_WHITE);
-  display.setCursor(84, 54);
-  display.print(":Batal");
+  if (infus[selectedChannel].state == BED_STANDBY) {
+    display.print("Putar ubah target");
+  } else {
+    display.print("Ubah hanya saat STBY");
+  }
 }
 
 // 7. Volume Configuration
@@ -427,10 +567,11 @@ void renderVolumeConfig() {
   // Footer Navigasi
   display.setTextSize(1);
   display.setCursor(6, 54);
-  display.print("OK:Simpan");
-  drawReturnIcon(74, 55, SSD1306_WHITE);
-  display.setCursor(84, 54);
-  display.print(":Batal");
+  if (infus[selectedChannel].state == BED_STANDBY) {
+    display.print("Putar ubah volume");
+  } else {
+    display.print("Ubah hanya saat STBY");
+  }
 }
 
 // 8. Network Status
@@ -464,25 +605,39 @@ void renderNetworkStatus() {
 
 // 9. Sensor Diagnostics
 void renderDiagnostics() {
-  // Sensor Status
-  drawCheckCircle(12, 10, 5, SSD1306_WHITE);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(24, 7);
-  display.printf("Sensor Bed 1 : %s", infus[0].isSensorActive ? "OK" : "OFF");
-
-  drawCheckCircle(12, 23, 5, SSD1306_WHITE);
-  display.setCursor(24, 20);
-  display.printf("Sensor Bed 2 : %s", infus[1].isSensorActive ? "OK" : "OFF");
+  display.setCursor(4, 6);
+  display.print("B1 DPM:");
+  if (!infus[0].isSensorActive)
+    display.print("Sensor OFF");
+  else if (infus[0].dpmValid)
+    display.print(infus[0].actualDPM);
+  else if (infus[0].state == BED_ALARM &&
+           infus[0].alarmCode == ALARM_FLOW_NOT_DETECTED)
+    display.print(infus[0].dpmStale ? "Stale" : "No drop");
+  else
+    display.print(dpmStatusText(0));
+  display.setCursor(4, 19);
+  display.print("B2 DPM:");
+  if (!infus[1].isSensorActive)
+    display.print("Sensor OFF");
+  else if (infus[1].dpmValid)
+    display.print(infus[1].actualDPM);
+  else if (infus[1].state == BED_ALARM &&
+           infus[1].alarmCode == ALARM_FLOW_NOT_DETECTED)
+    display.print(infus[1].dpmStale ? "Stale" : "No drop");
+  else
+    display.print(dpmStatusText(1));
 
   // Garis Pemisah
   display.drawLine(4, 33, 124, 33, SSD1306_WHITE);
 
   // Pulse Count
   display.setCursor(16, 39);
-  display.printf("Pulse Bed 1 : %ld", pulseCountA);
+  display.printf("Pulse Bed 1 : %ld", getPulseCount_Safe(0));
   display.setCursor(16, 51);
-  display.printf("Pulse Bed 2 : %ld", pulseCountB);
+  display.printf("Pulse Bed 2 : %ld", getPulseCount_Safe(1));
 }
 
 // 10. Alarm History
@@ -537,14 +692,24 @@ void renderAlarmWarning() {
   // Teks Peringatan Darurat
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(20, 30);
-  display.printf("ALARM BED %d!", alarmChannelTrigger + 1);
-
-  display.setCursor(44, 42);
-  display.print("MAMPET");
-
-  display.setCursor(48, 52);
-  display.print("HABIS");
+  if (alarmChannelTrigger >= 0 && alarmChannelTrigger < 2) {
+    display.setCursor(20, 30);
+    display.printf("ALARM BED %d", alarmChannelTrigger + 1);
+  }
+  if (alarmChannelTrigger >= 0 && alarmChannelTrigger < 2 &&
+      infus[alarmChannelTrigger].alarmCode == ALARM_PUMP_OUTPUT_FAILURE) {
+    display.setCursor(12, 42);
+    display.print("Gangguan output pompa");
+    display.setCursor(18, 50);
+    display.print("Periksa driver");
+  } else {
+    display.setCursor(22, 42);
+    display.print("Aliran tidak");
+    display.setCursor(34, 50);
+    display.print("terdeteksi");
+  }
+  display.setCursor(42, 57);
+  display.print("Klik: akui");
 }
 
 // 13. Confirmation (Pengaturan Disimpan!)
@@ -575,6 +740,9 @@ void renderConfirmation() {
 // LOOP RENDER DISPLAY UTAMA
 // ==========================================
 void updateDisplay() {
+  if (dripMutex != NULL && !xSemaphoreTake(dripMutex, pdMS_TO_TICKS(20)))
+    return;
+
   display.clearDisplay();
 
   switch (currentScreen) {
@@ -617,7 +785,18 @@ void updateDisplay() {
   case SCREEN_CONFIRMATION:
     renderConfirmation();
     break;
+  case SCREEN_BED_ACTIONS:
+    renderBedActions();
+    break;
+  case SCREEN_START_CONFIRMATION:
+    renderStartConfirmation();
+    break;
+  case SCREEN_ALARM_RESET_CONFIRMATION:
+    renderAlarmResetConfirmation();
+    break;
   }
 
+  if (dripMutex != NULL)
+    xSemaphoreGive(dripMutex);
   display.display();
 }

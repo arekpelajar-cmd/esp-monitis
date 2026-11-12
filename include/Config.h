@@ -2,28 +2,40 @@
 #define CONFIG_H
 
 #include <Arduino.h>
-#include <ESP32Servo.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
-// --- FITUR SIMULASI TANPA SENSOR FISIK ---
-// Set 'true' untuk simulasi otomatis tetesan (cocok untuk testing OLED & MQTT)
-// Set 'false' jika menggunakan sensor optik/IR fisik asli pada pin ESP32
-#define SIMULATION_MODE false
+// Five timestamps provide four intervals (~48 s at 5 DPM); a longer window
+// is steadier but reacts more slowly to changes.
+#define DPM_TIMESTAMP_COUNT 5
+#define DPM_STALE_TIMEOUT_MS 15000UL
+#define ALARM_RECOVERY_PULSE_COUNT DPM_TIMESTAMP_COUNT
+#define NO_FLOW_ALARM_TIMEOUT_MS 15000UL
 
-// --- PINOUT HARDWARE (DUAL-BED SYSTEM: 1 ESP32 -> 2 RANJANG) ---
-// BED 1 (Pasien 1)
+// No driver, pinout, or calibration has been selected. Keep all pump output
+// paths compiled out until the motor and driver datasheets are available.
+#define PUMP_OUTPUT_ENABLED 0
+#define PIN_PUMP_DRIVER_BED1 -1
+#define PIN_PUMP_DRIVER_BED2 -1
+
+// --- PINOUT INPUTS (DUAL-BED SYSTEM: 1 ESP32 -> 2 RANJANG) ---
 #define PIN_IR_A 27
-#define PIN_SERVO_A 18
-
-// BED 2 (Pasien 2)
 #define PIN_IR_B 14
-#define PIN_SERVO_B 19
 
 // Shared Inputs & OLED
 #define PIN_ENC_CLK 25
 #define PIN_ENC_DT 26
 #define PIN_ENC_SW 32
+
+// Buzzer untuk alarm audibel
+// #define PIN_BUZZER        13  // Buzzer removed per new alarm design
+
+// Helper inline untuk mengaktifkan/mematikan buzzer
+// static inline void buzzerOn()  { /* buzzer removed */ }
+static inline void buzzerOff() { /* buzzer removed */ }
+
+// Waktu masuk ke screen alarm (digunakan untuk animasi kedip)
+extern unsigned long alarmEnterTime;
 #define PIN_OLED_SDA 21
 #define PIN_OLED_SCL 22
 
@@ -43,43 +55,64 @@
 #define TOPIC_CONTROL_BED1   "monitis/bed1/control"
 #define TOPIC_CONTROL_BED2   "monitis/bed2/control"
 
-// Kode Alarm (digunakan di JSON MQTT)
-// 0 = NONE, 1 = OCCLUSION (mampet), 2 = EMPTY (habis)
-enum AlarmCode { ALARM_NONE = 0, ALARM_OCCLUSION = 1, ALARM_EMPTY = 2 };
+// No-drop alarms indicate absent sensor pulses, not a diagnosed cause.
+enum AlarmCode {
+  ALARM_NONE = 0,
+  ALARM_FLOW_NOT_DETECTED = 1,
+  ALARM_PUMP_OUTPUT_FAILURE = 2
+};
+
+enum BedState {
+  BED_STANDBY = 0,
+  BED_RUNNING = 1,
+  BED_PAUSED = 2,
+  BED_ALARM = 3
+};
+
+static inline const char *bedStateName(BedState state) {
+  switch (state) {
+    case BED_RUNNING: return "RUNNING";
+    case BED_PAUSED: return "PAUSED";
+    case BED_ALARM: return "ALARM";
+    default: return "STANDBY";
+  }
+}
 
 // --- STRUKTUR DATA CHANNEL INFUS ---
 struct DripChannel {
   int id;
   int pinIR;
-  int pinServo;
 
   // Status Infus
   volatile int targetDPM;
   volatile int actualDPM;
   volatile float sisaVolume;    // ml
   volatile float volumeAwal;    // ml
-  volatile bool isPaused;
-  volatile bool isAnomaly;
+  volatile BedState state;
   volatile bool isSensorActive; // true = sensor aktif, false = dinonaktifkan (abaikan alarm)
+  volatile bool configurationConfirmed;
+  volatile bool dpmValid;
+  volatile bool dpmStale;
+  volatile bool alarmAcknowledged;
+  volatile bool alarmRecoveryReady;
   volatile unsigned long lastDropTime;
 
-  // Field Kalkulasi Medis Tambahan
-  volatile float flowRateMlHr;  // Laju aliran dalam ml/jam
+  // Nominal flow conversions derived from the drop sensor, not direct flow sensors.
+  volatile float targetFlowRateMlHr;
+  volatile float measuredFlowRateMlHr;
   volatile long etaMinutes;     // Estimasi menit sisa cairan
   volatile int dropFactor;      // 20 tetes/ml (dewasa) atau 60 tetes/ml (anak-anak)
   volatile AlarmCode alarmCode; // Kode spesifik jenis alarm
 
-  // PID & Kontrol Servo
-  float kp;
-  float ki;
-  float kd;
+  // Pump request state; speed conversion belongs to a calibrated driver backend.
   float integral;
   float lastError;
-  int servoAngle;
-  Servo servo;
+  volatile float pumpCommandFlowRateMlHr;
+  volatile bool pumpCommandKnown;
+  volatile bool pumpCommandActive;
 };
 
-// --- STATE MACHINE UI OLED (Berdasarkan 13 UI Flow Guide) ---
+// --- OLED screen state machine ---
 enum ScreenState {
   SCREEN_STARTUP = 1,
   SCREEN_SUMMARY = 2,
@@ -93,7 +126,10 @@ enum ScreenState {
   SCREEN_ALARM_HISTORY = 10,
   SCREEN_SYSTEM_INFO = 11,
   SCREEN_ALARM_WARNING = 12,
-  SCREEN_CONFIRMATION = 13
+  SCREEN_CONFIRMATION = 13,
+  SCREEN_BED_ACTIONS = 14,
+  SCREEN_START_CONFIRMATION = 15,
+  SCREEN_ALARM_RESET_CONFIRMATION = 16
 };
 
 // Riwayat Alarm sederhana
@@ -105,17 +141,17 @@ struct AlarmLog {
 // Deklarasi Variabel Global Bersama
 extern DripChannel infus[2];
 extern SemaphoreHandle_t dripMutex;
-extern ScreenState currentScreen;
+extern volatile ScreenState currentScreen;
 extern ScreenState previousScreen;
 extern int selectedChannel;     // 0 = Channel A, 1 = Channel B
+extern int bedActionIndex;
 extern int settingsMenuIndex;   // Index kursor Main Settings (0 - 5)
-extern int alarmChannelTrigger; // Channel yang memicu alarm
+extern volatile int alarmChannelTrigger; // Channel yang memicu alarm
 extern volatile long pulseCountA;
 extern volatile long pulseCountB;
 extern AlarmLog alarmHistory[3];
 
 // Deklarasi Task Handles
 extern TaskHandle_t TaskControlHandle;
-extern TaskHandle_t TaskCommsHandle;
 
 #endif

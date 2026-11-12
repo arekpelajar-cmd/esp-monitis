@@ -1,5 +1,8 @@
 #include "Comms.h"
 #include "Config.h"
+#include "Control.h"
+#include "PumpOutput.h"
+#include "Sensor.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -12,15 +15,15 @@ static unsigned long lastTelemetryTime = 0;
 // Helper: Konversi AlarmCode enum ke string untuk JSON
 static const char* alarmCodeStr(AlarmCode code) {
     switch (code) {
-        case ALARM_OCCLUSION: return "OCCLUSION";
-        case ALARM_EMPTY:     return "EMPTY";
+        case ALARM_FLOW_NOT_DETECTED: return "FLOW_NOT_DETECTED";
+        case ALARM_PUMP_OUTPUT_FAILURE: return "PUMP_OUTPUT_FAILURE";
         default:              return "NONE";
     }
 }
 
 // Helper: Format menit sisa menjadi "HH:MM" atau "STOPPED"
-static String etaFormatted(long etaMin, bool isAnomaly, bool isPaused) {
-    if (isAnomaly || isPaused) return "STOPPED";
+static String etaFormatted(long etaMin, BedState state) {
+    if (state != BED_RUNNING) return "STOPPED";
     if (etaMin <= 0) return "00:00";
     long h = etaMin / 60;
     long m = etaMin % 60;
@@ -30,18 +33,59 @@ static String etaFormatted(long etaMin, bool isAnomaly, bool isPaused) {
 }
 
 // Helper: Bangun JSON lengkap satu bed ke dalam JsonObject
-static void buildBedJson(JsonObject& b, int i, unsigned long now) {
-    long lastDropSecAgo = (long)((now - infus[i].lastDropTime) / 1000UL);
+static bool buildBedJson(JsonObject& b, int i, unsigned long now) {
+    if (!xSemaphoreTake(dripMutex, pdMS_TO_TICKS(20)))
+        return false;
+
+    long lastDropSecAgo = (long)((now - getLastDropTime_Safe(i)) / 1000UL);
 
     b["bed"]             = i + 1;
+    b["state"]           = bedStateName(infus[i].state);
+    b["configuration_confirmed"] = (bool)infus[i].configurationConfirmed;
     b["sensor_active"]   = (bool)infus[i].isSensorActive;
-    b["paused"]          = (bool)infus[i].isPaused;
-    b["anomaly"]         = (bool)infus[i].isAnomaly;
+    b["paused"]          = infus[i].state == BED_PAUSED;
+    b["anomaly"]         = infus[i].state == BED_ALARM;
+    b["alarm_active"]    = infus[i].state == BED_ALARM;
+    b["alarm_acknowledged"] = (bool)infus[i].alarmAcknowledged;
+    b["alarm_recovery_ready"] = (bool)infus[i].alarmRecoveryReady;
     b["alarm_code"]      = alarmCodeStr(infus[i].alarmCode);
 
     b["target_dpm"]      = infus[i].targetDPM;
     b["actual_dpm"]      = infus[i].actualDPM;
-    b["flow_rate_ml_hr"] = serialized(String(infus[i].flowRateMlHr, 1));
+    b["actual_dpm_valid"] = (bool)infus[i].dpmValid;
+    b["actual_dpm_stale"] = (bool)infus[i].dpmStale;
+    b["measurement_status"] = !infus[i].isSensorActive
+                                  ? "SENSOR_DISABLED"
+                                  : infus[i].dpmValid
+                                        ? "VALID"
+                                        : infus[i].dpmStale
+                                              ? "STALE"
+                                              : infus[i].state == BED_ALARM
+                                                    ? infus[i].alarmCode ==
+                                                              ALARM_FLOW_NOT_DETECTED
+                                                          ? "NO_DROPS_DETECTED"
+                                                          : "OUTPUT_FAULT"
+                                                    : infus[i].state ==
+                                                              BED_RUNNING
+                                                          ? "MEASURING"
+                                                          : infus[i].state ==
+                                                                    BED_PAUSED
+                                                                ? "PAUSED"
+                                                                : "STANDBY";
+    if (infus[i].dropFactor > 0) {
+        b["target_flow_ml_hr"] =
+            serialized(String(infus[i].targetFlowRateMlHr, 1));
+        if (infus[i].dpmValid)
+            b["estimated_flow_ml_hr"] =
+                serialized(String(infus[i].measuredFlowRateMlHr, 1));
+        else
+            b["estimated_flow_ml_hr"] = nullptr;
+    } else {
+        b["target_flow_ml_hr"] = nullptr;
+        b["estimated_flow_ml_hr"] = nullptr;
+    }
+    b["flow_measurement_source"] = "drop_sensor_nominal_conversion";
+    b["flow_rate_is_direct_measurement"] = false;
 
     float sisaMl = (float)((int)(infus[i].sisaVolume * 10.0f)) / 10.0f;
     float volAwal = infus[i].volumeAwal;
@@ -53,12 +97,30 @@ static void buildBedJson(JsonObject& b, int i, unsigned long now) {
     b["volume_awal_ml"]  = serialized(String(volAwal, 1));
     b["persen_sisa"]     = serialized(String(pct, 1));
     b["eta_minutes"]     = infus[i].etaMinutes;
-    b["eta_formatted"]   = etaFormatted(infus[i].etaMinutes, infus[i].isAnomaly, infus[i].isPaused);
+    b["eta_formatted"]   = etaFormatted(infus[i].etaMinutes, infus[i].state);
 
     b["drop_factor"]     = infus[i].dropFactor;
     b["last_drop_sec_ago"] = lastDropSecAgo;
-    b["servo_angle"]     = infus[i].servoAngle;
-    b["pulse_count"]     = (i == 0) ? pulseCountA : pulseCountB;
+    const bool pumpReady = isPumpOutputReady(i);
+    b["pump_output_enabled"] = (bool)PUMP_OUTPUT_ENABLED;
+    b["pump_output_ready"] = pumpReady;
+    b["pump_status"] =
+        infus[i].alarmCode == ALARM_PUMP_OUTPUT_FAILURE
+            ? "OUTPUT_DISABLE_OR_COMMAND_FAILED"
+            : infus[i].pumpCommandActive
+                  ? "FLOW_REQUEST_ACTIVE"
+                  : pumpReady ? "READY_IDLE"
+                              : "DISABLED_UNCONFIGURED";
+    b["pump_command_known"] = (bool)infus[i].pumpCommandKnown;
+    b["pump_command_active"] = (bool)infus[i].pumpCommandActive;
+    if (infus[i].pumpCommandKnown)
+        b["pump_command_flow_ml_hr"] =
+            serialized(String(infus[i].pumpCommandFlowRateMlHr, 1));
+    else
+        b["pump_command_flow_ml_hr"] = nullptr;
+    b["pulse_count"]     = getPulseCount_Safe(i);
+    xSemaphoreGive(dripMutex);
+    return true;
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -77,14 +139,37 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             else if (doc.containsKey("ch")) targetBed = doc["ch"].as<int>();
 
             if (targetBed >= 0 && targetBed < 2) {
-                if (doc.containsKey("target_dpm")) {
-                    infus[targetBed].targetDPM = doc["target_dpm"];
+                DripChannel &bed = infus[targetBed];
+                if (doc.containsKey("target_dpm") && bed.state == BED_STANDBY) {
+                    int target = doc["target_dpm"].as<int>();
+                    if (target >= 5 && target <= 150) {
+                        bed.targetDPM = target;
+                        bed.configurationConfirmed = false;
+                    }
                 }
-                if (doc.containsKey("pause")) {
-                    infus[targetBed].isPaused = doc["pause"];
+                if (doc["pause"] | false) {
+                    if (bed.state == BED_RUNNING &&
+                        preparePumpOutputForInactiveState(targetBed))
+                        bed.state = BED_PAUSED;
                 }
                 if (doc.containsKey("sensor_active")) {
-                    infus[targetBed].isSensorActive = doc["sensor_active"];
+                    bool enabled = doc["sensor_active"].as<bool>();
+                    if (!enabled) {
+                        if ((bed.state == BED_RUNNING ||
+                             bed.state == BED_PAUSED) &&
+                            preparePumpOutputForInactiveState(targetBed)) {
+                            bed.state = BED_STANDBY;
+                            bed.configurationConfirmed = false;
+                        }
+                    }
+                    bed.isSensorActive = enabled;
+                }
+                if ((doc["standby"] | false) && bed.state != BED_ALARM) {
+                    if (bed.state == BED_STANDBY ||
+                        preparePumpOutputForInactiveState(targetBed)) {
+                        bed.state = BED_STANDBY;
+                        bed.configurationConfirmed = false;
+                    }
                 }
             }
             xSemaphoreGive(dripMutex);
@@ -139,36 +224,48 @@ void taskCommsCode(void *pvParameters) {
                     lastTelemetryTime = now;
 
                     // Hitung status sistem global
-                    bool anyAnomaly = infus[0].isAnomaly || infus[1].isAnomaly;
-                    const char* sysStatus = anyAnomaly ? "ALARM" : "NORMAL";
+                    if (!xSemaphoreTake(dripMutex, pdMS_TO_TICKS(20))) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        continue;
+                    }
+                    BedState bedStates[2] = {infus[0].state, infus[1].state};
+                    xSemaphoreGive(dripMutex);
+                    const char *sysStatus =
+                        bedStates[0] == BED_ALARM || bedStates[1] == BED_ALARM
+                            ? "ALARM"
+                            : bedStates[0] == bedStates[1]
+                                  ? bedStateName(bedStates[0])
+                                  : "MIXED";
 
                     // === 1. Publish Bed 1 (topik khusus) ===
                     {
-                        DynamicJsonDocument doc1(512);
+                        DynamicJsonDocument doc1(1024);
                         doc1["device_id"]     = "MONITIS-ESP32";
                         doc1["uptime_sec"]    = now / 1000;
                         doc1["system_status"] = sysStatus;
                         JsonObject b1 = doc1.createNestedObject("bed_data");
-                        buildBedJson(b1, 0, now);
-                        String s1; serializeJson(doc1, s1);
-                        mqtt.publish(TOPIC_BED1_TELEMETRY, s1.c_str());
+                        if (buildBedJson(b1, 0, now)) {
+                            String s1; serializeJson(doc1, s1);
+                            mqtt.publish(TOPIC_BED1_TELEMETRY, s1.c_str());
+                        }
                     }
 
                     // === 2. Publish Bed 2 (topik khusus) ===
                     {
-                        DynamicJsonDocument doc2(512);
+                        DynamicJsonDocument doc2(1024);
                         doc2["device_id"]     = "MONITIS-ESP32";
                         doc2["uptime_sec"]    = now / 1000;
                         doc2["system_status"] = sysStatus;
                         JsonObject b2 = doc2.createNestedObject("bed_data");
-                        buildBedJson(b2, 1, now);
-                        String s2; serializeJson(doc2, s2);
-                        mqtt.publish(TOPIC_BED2_TELEMETRY, s2.c_str());
+                        if (buildBedJson(b2, 1, now)) {
+                            String s2; serializeJson(doc2, s2);
+                            mqtt.publish(TOPIC_BED2_TELEMETRY, s2.c_str());
+                        }
                     }
 
-                    // === 3. Publish Global Summary Lengkap Medical-Grade ===
+                    // === 3. Publish complete global summary ===
                     {
-                        DynamicJsonDocument docAll(1024);
+                        DynamicJsonDocument docAll(2048);
                         docAll["device_id"]     = "MONITIS-ESP32";
                         docAll["uptime_sec"]    = now / 1000;
                         docAll["wifi_rssi"]     = WiFi.RSSI();
@@ -176,12 +273,16 @@ void taskCommsCode(void *pvParameters) {
                         docAll["system_status"] = sysStatus;
 
                         JsonArray beds = docAll.createNestedArray("beds");
+                        bool bedsBuilt = true;
                         for (int i = 0; i < 2; i++) {
                             JsonObject b = beds.createNestedObject();
-                            buildBedJson(b, i, now);
+                            if (!buildBedJson(b, i, now))
+                                bedsBuilt = false;
                         }
-                        String sAll; serializeJson(docAll, sAll);
-                        mqtt.publish(TOPIC_ALL_TELEMETRY, sAll.c_str());
+                        if (bedsBuilt) {
+                            String sAll; serializeJson(docAll, sAll);
+                            mqtt.publish(TOPIC_ALL_TELEMETRY, sAll.c_str());
+                        }
                     }
                 }
             }
